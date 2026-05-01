@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -18,6 +19,8 @@ from app.agent.tools import (
     validate_materials_and_samples,
 )
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_EXTRACT = """You are a life-sciences CRM assistant for field reps logging HCP interactions.
@@ -37,10 +40,13 @@ def _openrouter_model(primary: bool = True) -> str:
 
 def _extract_json(text: str) -> dict[str, Any]:
     start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1:
+    if start == -1:
         raise ValueError("no json in model output")
-    return json.loads(text[start : end + 1])
+    decoder = json.JSONDecoder()
+    obj, _ = decoder.raw_decode(text[start:])
+    if not isinstance(obj, dict):
+        raise ValueError("model output json is not an object")
+    return obj
 
 
 def _call_openrouter(user_text: str, form_draft: dict, primary: bool) -> str:
@@ -95,9 +101,27 @@ def _invoke_extraction(user_text: str, form_draft: dict) -> dict[str, Any]:
     try:
         text = _call_openrouter(user_text=user_text, form_draft=form_draft, primary=True)
         return _extract_json(text)
-    except Exception:
-        text = _call_openrouter(user_text=user_text, form_draft=form_draft, primary=False)
-        return _extract_json(text)
+    except Exception as first_err:
+        logger.warning("Primary OpenRouter extraction failed: %s", first_err)
+        try:
+            text = _call_openrouter(user_text=user_text, form_draft=form_draft, primary=False)
+            return _extract_json(text)
+        except Exception as second_err:
+            logger.warning("Fallback OpenRouter extraction failed: %s", second_err)
+            return {
+                "hcp_name": None,
+                "interaction_type": None,
+                "occurred_at": None,
+                "attendees": [],
+                "topics_discussed": user_text,
+                "sentiment": None,
+                "outcomes": "",
+                "follow_up_actions": "",
+                "materials_mentioned": [],
+                "samples_mentioned": [],
+                "confidence": {},
+                "_error": f"OpenRouter unavailable ({type(second_err).__name__}); applied graceful fallback.",
+            }
 
 
 def node_extract(state: AgentGraphState) -> AgentGraphState:
